@@ -4,11 +4,12 @@ Runs, in order: data loading -> formation-period screening -> hedge ratio
 estimation -> signal generation -> backtest over each trading period ->
 metrics -> validation, then produces the final summary tables/figures.
 
-Data loading, screening, hedge ratio estimation, signal generation, and
-backtesting are all implemented (`load_and_split_data`,
-`screen_and_select_pairs`, `build_hedge_ratios`, `build_signals`,
-`run_backtest_phase`, `run_pipeline_through_backtest`). `run_pipeline`
-remains a stub until metrics.py and validation.py are implemented.
+Data loading, screening, hedge ratio estimation, signal generation,
+backtesting, and metrics summarisation are all implemented
+(`load_and_split_data`, `screen_and_select_pairs`, `build_hedge_ratios`,
+`build_signals`, `run_backtest_phase`, `run_metrics_phase`,
+`run_pipeline_through_metrics`). `run_pipeline` remains a stub until
+validation.py is implemented.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import logging
 
 import pandas as pd
 
-from pairs_trading import backtest, config, data, hedge_ratio, screening, signals
+from pairs_trading import backtest, config, data, hedge_ratio, metrics, screening, signals
 
 logger = logging.getLogger(__name__)
 
@@ -243,13 +244,88 @@ def run_backtest_phase(
     }
 
 
+def run_metrics_phase(
+    backtest_results: dict[str, pd.DataFrame],
+    signals_dict: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    """Summarise per-pair and portfolio performance metrics and save to CSV.
+
+    Restricted to the two trading periods (not formation), consistent with
+    `run_backtest_phase`'s CSVs: formation-period performance already
+    informed threshold selection, so it is not a second out-of-sample
+    result to report alongside the genuine out-of-sample figures.
+
+    Args:
+        backtest_results: Output of `run_backtest_phase`.
+        signals_dict: Output of `build_signals`.
+
+    Returns:
+        Dict with keys "by_pair" (output of `metrics.summarise_all_pairs`)
+        and "portfolio" (output of `metrics.summarise_portfolio`), written
+        to `config.RESULTS_DIR / "metrics_by_pair.csv"` and
+        `config.RESULTS_DIR / "metrics_portfolio.csv"` respectively. The
+        saved/printed "by_pair" table flattens "exit_reason_counts" into
+        separate "exit_mean_reversion"/"exit_max_holding"/"exit_stop_loss"
+        columns for CSV/terminal friendliness.
+    """
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    trading_periods = ["trading_period_1", "trading_period_2"]
+
+    by_pair = metrics.summarise_all_pairs(
+        backtest_results["all_periods"], signals_dict["positions"], periods=trading_periods
+    )
+
+    average_returns = backtest_results["average_returns"]
+    average_series_by_period = {
+        period_name: average_returns.loc[
+            average_returns["period"] == period_name
+        ].set_index("date")["average_cumulative_net_return"]
+        for period_name in trading_periods
+    }
+    portfolio = metrics.summarise_portfolio(average_series_by_period)
+
+    exit_counts_expanded = pd.json_normalize(by_pair["exit_reason_counts"]).add_prefix("exit_")
+    by_pair_flat = pd.concat([by_pair.drop(columns="exit_reason_counts"), exit_counts_expanded], axis=1)
+
+    by_pair_flat.to_csv(config.RESULTS_DIR / "metrics_by_pair.csv", index=False)
+    portfolio.to_csv(config.RESULTS_DIR / "metrics_portfolio.csv", index=False)
+    logger.info(
+        "Wrote metrics_by_pair (%d rows), metrics_portfolio (%d rows) to %s",
+        len(by_pair_flat),
+        len(portfolio),
+        config.RESULTS_DIR,
+    )
+
+    print("\n=== Metrics: per-pair summary (trading periods only) ===")
+    print(
+        by_pair_flat[
+            [
+                "pair",
+                "period",
+                "cumulative_net_return",
+                "sharpe",
+                "max_drawdown",
+                "n_trades",
+                "win_rate",
+                "avg_holding_days",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\n=== Metrics: equal-weighted portfolio summary ===")
+    print(portfolio[["period", "cumulative_return", "sharpe", "max_drawdown"]].to_string(index=False))
+
+    return {"by_pair": by_pair, "portfolio": portfolio}
+
+
 def run_screening_phase() -> dict[str, pd.DataFrame]:
     """Load cached candidate price data and run screening plus formation-period hedge ratio estimation.
 
     Standalone convenience entry point for just the screening and
-    hedge-ratio stages. `run_pipeline_through_backtest` runs this same
-    work (without a second data load) plus signal generation and
-    backtesting.
+    hedge-ratio stages. `run_pipeline_through_metrics` runs this same
+    work (without a second data load) plus signal generation,
+    backtesting, and metrics summarisation.
 
     Returns:
         The dict returned by `screen_and_select_pairs`, with an added
@@ -291,24 +367,25 @@ def run_screening_phase() -> dict[str, pd.DataFrame]:
     return results
 
 
-def run_pipeline_through_backtest() -> dict[str, pd.DataFrame]:
-    """Load data once and run every implemented stage: screening, hedge ratios, signals, backtest.
+def run_pipeline_through_metrics() -> dict[str, pd.DataFrame]:
+    """Load data once and run every implemented stage: screening, hedge ratios, signals, backtest, metrics.
 
     This is the current top-level entry point (called from `__main__`).
     Loads the price panel a single time (unlike calling
-    `run_screening_phase` followed by a separate signals/backtest step,
-    which would reload it) and threads it through
+    `run_screening_phase` followed by separate signals/backtest/metrics
+    steps, which would reload it) and threads it through
     `screen_and_select_pairs` -> `build_hedge_ratios` -> `build_signals`
-    -> `run_backtest_phase`. `run_pipeline` will eventually extend this
-    with metrics.py and validation.py once those are implemented.
+    -> `run_backtest_phase` -> `run_metrics_phase`. `run_pipeline` will
+    eventually extend this with validation.py once implemented.
 
     Returns:
         Dict merging: `screen_and_select_pairs`'s keys, "hedge_ratios"
         (from `build_hedge_ratios`), "signals_positions"/
-        "signals_thresholds" (from `build_signals`), and
+        "signals_thresholds" (from `build_signals`),
         "backtest_all_periods"/"backtest_trading_period_1"/
         "backtest_trading_period_2"/"backtest_average_returns" (from
-        `run_backtest_phase`).
+        `run_backtest_phase`), and "metrics_by_pair"/"metrics_portfolio"
+        (from `run_metrics_phase`).
     """
     data_splits = load_and_split_data()
     full_prices = data_splits["full"]
@@ -329,21 +406,9 @@ def run_pipeline_through_backtest() -> dict[str, pd.DataFrame]:
     results["backtest_trading_period_2"] = backtest_results["trading_period_2"]
     results["backtest_average_returns"] = backtest_results["average_returns"]
 
-    print("\n=== Backtest: final cumulative net return per pair per trading period ===")
-    for period_name in ("trading_period_1", "trading_period_2"):
-        period_df = backtest_results["all_periods"]
-        period_df = period_df[period_df["period"] == period_name]
-        final_by_pair = period_df.groupby("pair")["cumulative_net_return"].last()
-        print(f"-- {period_name} --")
-        print(final_by_pair.to_string())
-
-    print("\n=== Backtest: equal-weighted average cumulative net return per trading period ===")
-    average_returns = backtest_results["average_returns"]
-    for period_name in ("trading_period_1", "trading_period_2"):
-        final_avg = average_returns.loc[
-            average_returns["period"] == period_name, "average_cumulative_net_return"
-        ].iloc[-1]
-        print(f"  {period_name}: {final_avg:.4f}")
+    metrics_results = run_metrics_phase(backtest_results, signals_dict)
+    results["metrics_by_pair"] = metrics_results["by_pair"]
+    results["metrics_portfolio"] = metrics_results["portfolio"]
 
     return results
 
@@ -351,9 +416,9 @@ def run_pipeline_through_backtest() -> dict[str, pd.DataFrame]:
 def run_pipeline() -> dict[str, pd.DataFrame]:
     """Run the full pipeline end-to-end and produce final tables/figures.
 
-    Orchestrates `run_pipeline_through_backtest` (data loading, screening,
-    hedge ratios, signals, backtest) plus metrics.py and validation.py,
-    once those are implemented.
+    Orchestrates `run_pipeline_through_metrics` (data loading, screening,
+    hedge ratios, signals, backtest, metrics) plus validation.py, once
+    implemented.
 
     Returns:
         Dict of result tables keyed by name (e.g. "screened_pairs",
@@ -365,4 +430,4 @@ def run_pipeline() -> dict[str, pd.DataFrame]:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run_pipeline_through_backtest()
+    run_pipeline_through_metrics()
