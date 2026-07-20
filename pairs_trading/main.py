@@ -4,10 +4,11 @@ Runs, in order: data loading -> formation-period screening -> hedge ratio
 estimation -> signal generation -> backtest over each trading period ->
 metrics -> validation, then produces the final summary tables/figures.
 
-Only the data-loading and screening stages are implemented so far
-(`load_and_split_data`, `screen_and_select_pairs`, `run_screening_phase`).
-`run_pipeline` remains a stub until hedge_ratio.py, signals.py, backtest.py,
-metrics.py, and validation.py are implemented in later phases.
+Only the data-loading, screening, and formation-period hedge ratio stages
+are implemented so far (`load_and_split_data`, `screen_and_select_pairs`,
+`build_hedge_ratios`, `run_screening_phase`). `run_pipeline` remains a stub
+until signals.py, backtest.py, metrics.py, and validation.py are
+implemented in later phases.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import logging
 
 import pandas as pd
 
-from pairs_trading import config, data, screening
+from pairs_trading import config, data, hedge_ratio, screening
 
 logger = logging.getLogger(__name__)
 
@@ -93,16 +94,51 @@ def screen_and_select_pairs(formation_prices: pd.DataFrame) -> dict[str, pd.Data
     return results
 
 
-def run_screening_phase() -> dict[str, pd.DataFrame]:
-    """Load cached candidate price data and run the full formation-period screening phase.
+def build_hedge_ratios(
+    formation_prices: pd.DataFrame,
+    selected_pairs_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fit formation-period hedge ratios for the selected pairs and save to CSV.
 
-    This is the current entry point for the screening stage of the
-    pipeline. `run_pipeline` will eventually call this as its first stage
-    once hedge_ratio.py, signals.py, backtest.py, metrics.py, and
+    Thin wrapper around `hedge_ratio.build_hedge_ratios_for_selected_pairs`
+    that also writes the result to `config.RESULTS_DIR / "hedge_ratios.csv"`,
+    so signals.py/backtest.py (and the report) can read a single,
+    already-computed table rather than each re-fitting alpha/beta itself.
+
+    Args:
+        formation_prices: Price panel restricted to the formation period
+            (`config.FORMATION_START` to `config.FORMATION_END`).
+        selected_pairs_df: Output of
+            `screen_and_select_pairs(...)["selected_pairs"]`.
+
+    Returns:
+        The DataFrame from `hedge_ratio.build_hedge_ratios_for_selected_pairs`,
+        also written to `config.RESULTS_DIR / "hedge_ratios.csv"`.
+    """
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    hedge_ratios = hedge_ratio.build_hedge_ratios_for_selected_pairs(
+        formation_prices, selected_pairs_df, config.FORMATION_START, config.FORMATION_END
+    )
+
+    out_path = config.RESULTS_DIR / "hedge_ratios.csv"
+    hedge_ratios.to_csv(out_path, index=False)
+    logger.info("Wrote hedge_ratios (%d rows) to %s", len(hedge_ratios), out_path)
+
+    return hedge_ratios
+
+
+def run_screening_phase() -> dict[str, pd.DataFrame]:
+    """Load cached candidate price data and run screening plus formation-period hedge ratio estimation.
+
+    This is the current entry point for the screening and hedge-ratio
+    stages of the pipeline. `run_pipeline` will eventually call this as
+    its first stages once signals.py, backtest.py, metrics.py, and
     validation.py are implemented.
 
     Returns:
-        The dict returned by `screen_and_select_pairs`.
+        The dict returned by `screen_and_select_pairs`, with an added
+        "hedge_ratios" key holding the output of `build_hedge_ratios`.
     """
     data_splits = load_and_split_data()
     results = screen_and_select_pairs(data_splits["formation"])
@@ -120,16 +156,32 @@ def run_screening_phase() -> dict[str, pd.DataFrame]:
         ].to_string(index=False)
     )
 
+    results["hedge_ratios"] = build_hedge_ratios(data_splits["formation"], selected)
+
+    print("\n=== Formation-period hedge ratios ===")
+    print(
+        results["hedge_ratios"][
+            [
+                "pair",
+                "dependent_ticker",
+                "independent_ticker",
+                "alpha",
+                "beta",
+                "r_squared",
+                "half_life_days",
+            ]
+        ].to_string(index=False)
+    )
+
     return results
 
 
 def run_pipeline() -> dict[str, pd.DataFrame]:
     """Run the full pipeline end-to-end and produce final tables/figures.
 
-    Orchestrates: data.load_all_candidate_prices -> screening (via
-    `run_screening_phase`) -> hedge_ratio (static + Kalman) ->
-    signals.generate_signals -> backtest.run_backtest for each trading
-    period -> metrics -> validation.
+    Orchestrates: data.load_all_candidate_prices -> screening + hedge_ratio
+    (via `run_screening_phase`) -> signals.build_signals_for_selected_pairs ->
+    backtest.run_backtest for each trading period -> metrics -> validation.
 
     Returns:
         Dict of result tables keyed by name (e.g. "screened_pairs",

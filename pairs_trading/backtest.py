@@ -55,7 +55,7 @@ def run_backtest(
         price_x: Price series for the independent leg.
         hedge_ratio: Hedge ratio series (static or time-varying), aligned to
             price_y/price_x.
-        positions: Position series (+1/0/-1) from signals.generate_signals,
+        positions: Position series (+1/0/-1) from signals.generate_positions,
             aligned to price_y/price_x.
         capital_per_pair: Dollar notional allocated to this pair.
         transaction_cost_bps: Transaction cost in basis points per unit of turnover.

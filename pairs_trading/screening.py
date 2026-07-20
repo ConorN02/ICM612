@@ -35,10 +35,9 @@ import logging
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
 from statsmodels.tsa.stattools import adfuller, coint
 
-from pairs_trading import config
+from pairs_trading import config, hedge_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -175,7 +174,10 @@ def cointegration_test(
     rather than presented as an arbitrary pick.
 
     For the *same* chosen direction, a second, manual test is run: OLS
-    regress the dependent leg on the independent leg, then run an Augmented
+    regress the dependent leg on the independent leg (via
+    `hedge_ratio.ols_regress`, the same regression primitive
+    `hedge_ratio.static_ols_hedge_ratio` uses, so this module never fits
+    its own separate copy of that logic), then run an Augmented
     Dickey-Fuller test on the residuals, compared against the *generic* ADF
     critical values in `config.GENERIC_ADF_CRITICAL_VALUES` rather than the
     correct Engle-Granger/MacKinnon values `coint` already applied. This
@@ -236,9 +238,8 @@ def cointegration_test(
             f"evidence against the null of no cointegration in that direction."
         )
 
-    ols_result = sm.OLS(dependent, sm.add_constant(independent)).fit()
-    residuals = ols_result.resid
-    generic_adf_stat, generic_adf_pvalue = adfuller(residuals, autolag="AIC")[:2]
+    ols_fit = hedge_ratio.ols_regress(dependent, independent)
+    generic_adf_stat, generic_adf_pvalue = adfuller(ols_fit["residuals"], autolag="AIC")[:2]
 
     generic_key = _generic_adf_critical_key(config.COINTEGRATION_SIGNIFICANCE)
     generic_critical_value = config.GENERIC_ADF_CRITICAL_VALUES[generic_key]
@@ -254,8 +255,8 @@ def cointegration_test(
         "eg_critical_value_5pct": float(eg_crit[1]),
         "eg_critical_value_10pct": float(eg_crit[2]),
         "eg_is_cointegrated": bool(eg_pvalue <= config.COINTEGRATION_SIGNIFICANCE),
-        "ols_alpha": float(ols_result.params.iloc[0]),
-        "ols_beta": float(ols_result.params.iloc[1]),
+        "ols_alpha": ols_fit["alpha"],
+        "ols_beta": ols_fit["beta"],
         "generic_adf_statistic": float(generic_adf_stat),
         "generic_adf_p_value": float(generic_adf_pvalue),
         "generic_adf_critical_value_1pct": config.GENERIC_ADF_CRITICAL_VALUES["1%"],

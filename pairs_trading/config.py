@@ -115,16 +115,38 @@ KALMAN_INITIAL_STATE_MEAN: Final[list[float]] = [0.0, 1.0]  # [intercept, beta] 
 # ---------------------------------------------------------------------------
 # Signal generation (signals.py)
 # ---------------------------------------------------------------------------
-ZSCORE_LOOKBACK: Final[int] = 30  # rolling window (trading days) for spread mean/std
-ENTRY_ZSCORE: Final[float] = 2.0
-EXIT_ZSCORE: Final[float] = 0.5
-STOP_LOSS_ZSCORE: Final[float] = 4.0
-USE_VOLATILITY_ADJUSTED_THRESHOLD: Final[bool] = False
-VOLATILITY_LOOKBACK: Final[int] = 60  # window for the volatility-adjusted threshold variant
+# Z-scoring uses the FIXED formation-period mean/std from hedge_ratio.py
+# (hedge_ratio.spread_zscore), not a rolling window, so there is no
+# "lookback" parameter here by design: re-centring against a rolling
+# window would itself leak local (including future-adjacent) information
+# into the signal.
+DEFAULT_ENTRY_THRESHOLD: Final[float] = 2.0  # |z| to open a position
+DEFAULT_EXIT_THRESHOLD: Final[float] = 0.0  # |z| to close on mean reversion (0 = revert to formation mean)
 
-# Grids used for threshold sensitivity analysis.
-ENTRY_ZSCORE_GRID: Final[list[float]] = [1.0, 1.5, 2.0, 2.5, 3.0]
-EXIT_ZSCORE_GRID: Final[list[float]] = [0.0, 0.25, 0.5, 0.75, 1.0]
+# Force-close any position still open after this many trading days, so a
+# single non-reverting trade cannot dominate the backtest. Set comfortably
+# above the longest formation-period half-life observed across the 3
+# selected pairs (~60 trading days for DAL/UAL; see results/hedge_ratios.csv).
+MAX_HOLDING_DAYS: Final[int] = 120
+
+# Force-close a position if |z| reaches this level, as a risk control
+# tracked separately from (and reported separately from) a normal
+# mean-reversion exit. A stop-loss also blocks re-entry into the same pair
+# ("cooling_down" in signals.generate_positions) until z first returns
+# inside +/-DEFAULT_ENTRY_THRESHOLD's entry_threshold band, unlike a
+# max-holding close which allows immediate re-entry -- see that function's
+# docstring for the reasoning.
+STOP_LOSS_THRESHOLD: Final[float] = 4.0
+
+# If True, signals.build_signals_for_selected_pairs selects entry/exit
+# thresholds per pair via a formation-period-only grid search
+# (signals.threshold_sensitivity_grid) rather than using
+# DEFAULT_ENTRY_THRESHOLD/DEFAULT_EXIT_THRESHOLD for every pair.
+USE_THRESHOLD_GRID: Final[bool] = True
+
+# Grids searched by signals.threshold_sensitivity_grid.
+ENTRY_THRESHOLD_GRID: Final[list[float]] = [1.5, 2.0, 2.5, 3.0]
+EXIT_THRESHOLD_GRID: Final[list[float]] = [0.0, 0.5]
 
 # ---------------------------------------------------------------------------
 # Backtest (backtest.py)
