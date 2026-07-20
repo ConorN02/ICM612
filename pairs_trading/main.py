@@ -4,12 +4,12 @@ Runs, in order: data loading -> formation-period screening -> hedge ratio
 estimation -> signal generation -> backtest over each trading period ->
 metrics -> validation, then produces the final summary tables/figures.
 
-Data loading, screening, hedge ratio estimation, signal generation,
-backtesting, and metrics summarisation are all implemented
-(`load_and_split_data`, `screen_and_select_pairs`, `build_hedge_ratios`,
-`build_signals`, `run_backtest_phase`, `run_metrics_phase`,
-`run_pipeline_through_metrics`). `run_pipeline` remains a stub until
-validation.py is implemented.
+Every stage is implemented (`load_and_split_data`, `screen_and_select_pairs`,
+`build_hedge_ratios`, `build_signals`, `run_backtest_phase`,
+`run_metrics_phase`, `run_validation_phase`,
+`run_pipeline_through_validation`). `run_pipeline` is a thin alias for
+`run_pipeline_through_validation`; `__main__` calls
+`run_pipeline_through_validation` directly.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import logging
 
 import pandas as pd
 
-from pairs_trading import backtest, config, data, hedge_ratio, metrics, screening, signals
+from pairs_trading import backtest, config, data, hedge_ratio, metrics, screening, signals, validation
 
 logger = logging.getLogger(__name__)
 
@@ -319,13 +319,186 @@ def run_metrics_phase(
     return {"by_pair": by_pair, "portfolio": portfolio}
 
 
+def run_validation_phase(
+    price_panel: pd.DataFrame,
+    backtest_results: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    """Run bootstrap significance, random-pair permutation, and buy-and-hold validation, saving CSVs.
+
+    For each trading period ("trading_period_1", "trading_period_2"):
+        - Bootstraps every selected pair's daily net_return series AND the
+          equal-weighted portfolio's daily return series
+          (`validation.bootstrap_significance_test`), one row each.
+        - Runs a random-pair permutation test on the portfolio's actual
+          cumulative return (`validation.random_pair_benchmark`); this is
+          the slow step (re-runs the full hedge_ratio -> signals ->
+          backtest pipeline `config.N_RANDOM_PAIRS_BENCHMARK` times), so a
+          tqdm progress bar is shown.
+        - Compares the portfolio's cumulative return/Sharpe against a
+          `config.BENCHMARK_TICKER` buy-and-hold
+          (`validation.compare_to_buy_and_hold`).
+
+    Args:
+        price_panel: Full price panel, columns=tickers, indexed by date.
+        backtest_results: Output of `run_backtest_phase` (used for
+            "all_periods", to get each pair's net_return series, and
+            "average_returns", for the portfolio's cumulative series).
+
+    Returns:
+        Dict with keys "bootstrap" (one row per pair/period plus one row
+        per portfolio/period, written to
+        `config.RESULTS_DIR / "validation_bootstrap.csv"`), "permutation"
+        (one row per period, written to
+        `config.RESULTS_DIR / "validation_permutation.csv"`),
+        "buy_and_hold" (one row per period, written to
+        `config.RESULTS_DIR / "validation_buy_and_hold.csv"`).
+    """
+    config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    trading_periods = [
+        ("trading_period_1", config.TRADING_PERIOD_1_START, config.TRADING_PERIOD_1_END),
+        ("trading_period_2", config.TRADING_PERIOD_2_START, config.TRADING_PERIOD_2_END),
+    ]
+
+    all_positions = backtest_results["all_periods"]
+    average_returns = backtest_results["average_returns"]
+
+    bootstrap_rows = []
+    permutation_rows = []
+    buy_and_hold_rows = []
+
+    for period_name, period_start, period_end in trading_periods:
+        period_df = all_positions[all_positions["period"] == period_name]
+
+        for pair in sorted(period_df["pair"].unique()):
+            pair_returns = period_df.loc[period_df["pair"] == pair, "net_return"]
+            result = validation.bootstrap_significance_test(pair_returns)
+            bootstrap_rows.append(
+                {
+                    "level": "pair",
+                    "pair": pair,
+                    "period": period_name,
+                    "observed_sharpe": result["observed_sharpe"],
+                    "observed_cumulative_return": result["observed_cumulative_return"],
+                    "mean_sharpe": result["mean_sharpe"],
+                    "sharpe_ci_lower": result["sharpe_ci_lower"],
+                    "sharpe_ci_upper": result["sharpe_ci_upper"],
+                    "mean_cumulative_return": result["mean_cumulative_return"],
+                    "cumulative_return_ci_lower": result["cumulative_return_ci_lower"],
+                    "cumulative_return_ci_upper": result["cumulative_return_ci_upper"],
+                    "p_value_cumulative_return_le_zero": result["p_value_cumulative_return_le_zero"],
+                }
+            )
+
+        portfolio_cumulative = (
+            average_returns.loc[average_returns["period"] == period_name]
+            .set_index("date")["average_cumulative_net_return"]
+            .sort_index()
+        )
+        portfolio_daily = portfolio_cumulative.diff()
+        portfolio_daily.iloc[0] = portfolio_cumulative.iloc[0]
+
+        portfolio_bootstrap = validation.bootstrap_significance_test(portfolio_daily)
+        bootstrap_rows.append(
+            {
+                "level": "portfolio",
+                "pair": None,
+                "period": period_name,
+                "observed_sharpe": portfolio_bootstrap["observed_sharpe"],
+                "observed_cumulative_return": portfolio_bootstrap["observed_cumulative_return"],
+                "mean_sharpe": portfolio_bootstrap["mean_sharpe"],
+                "sharpe_ci_lower": portfolio_bootstrap["sharpe_ci_lower"],
+                "sharpe_ci_upper": portfolio_bootstrap["sharpe_ci_upper"],
+                "mean_cumulative_return": portfolio_bootstrap["mean_cumulative_return"],
+                "cumulative_return_ci_lower": portfolio_bootstrap["cumulative_return_ci_lower"],
+                "cumulative_return_ci_upper": portfolio_bootstrap["cumulative_return_ci_upper"],
+                "p_value_cumulative_return_le_zero": portfolio_bootstrap["p_value_cumulative_return_le_zero"],
+            }
+        )
+
+        actual_portfolio_return = float(portfolio_cumulative.iloc[-1])
+        print(f"\nRunning random-pair permutation test for {period_name}...")
+        permutation_result = validation.random_pair_benchmark(
+            price_panel,
+            config.FORMATION_START,
+            config.FORMATION_END,
+            period_start,
+            period_end,
+            actual_portfolio_return,
+        )
+        permutation_rows.append(
+            {
+                "period": period_name,
+                "actual_portfolio_return": permutation_result["actual_portfolio_return"],
+                "simulated_mean": permutation_result["simulated_mean"],
+                "simulated_std": permutation_result["simulated_std"],
+                "percentile_of_actual": permutation_result["percentile_of_actual"],
+                "p_value_actual_ge_random": permutation_result["p_value_actual_ge_random"],
+                "n_simulations": permutation_result["n_simulations"],
+            }
+        )
+
+        benchmark_prices = price_panel.loc[period_start:period_end, config.BENCHMARK_TICKER]
+        bh_result = validation.compare_to_buy_and_hold(portfolio_cumulative, benchmark_prices)
+        buy_and_hold_rows.append({"period": period_name, **bh_result})
+
+    bootstrap_df = pd.DataFrame(bootstrap_rows)
+    permutation_df = pd.DataFrame(permutation_rows)
+    buy_and_hold_df = pd.DataFrame(buy_and_hold_rows)
+
+    bootstrap_df.to_csv(config.RESULTS_DIR / "validation_bootstrap.csv", index=False)
+    permutation_df.to_csv(config.RESULTS_DIR / "validation_permutation.csv", index=False)
+    buy_and_hold_df.to_csv(config.RESULTS_DIR / "validation_buy_and_hold.csv", index=False)
+    logger.info(
+        "Wrote validation_bootstrap (%d rows), validation_permutation (%d rows), "
+        "validation_buy_and_hold (%d rows) to %s",
+        len(bootstrap_df),
+        len(permutation_df),
+        len(buy_and_hold_df),
+        config.RESULTS_DIR,
+    )
+
+    print("\n=== Validation: bootstrap significance (95% CI on cumulative return) ===")
+    print(
+        bootstrap_df[
+            [
+                "level",
+                "pair",
+                "period",
+                "observed_cumulative_return",
+                "cumulative_return_ci_lower",
+                "cumulative_return_ci_upper",
+                "p_value_cumulative_return_le_zero",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\n=== Validation: random-pair permutation test (portfolio level) ===")
+    print(
+        permutation_df[
+            [
+                "period",
+                "actual_portfolio_return",
+                "simulated_mean",
+                "percentile_of_actual",
+                "p_value_actual_ge_random",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\n=== Validation: buy-and-hold comparison (portfolio vs. benchmark) ===")
+    print(buy_and_hold_df.to_string(index=False))
+
+    return {"bootstrap": bootstrap_df, "permutation": permutation_df, "buy_and_hold": buy_and_hold_df}
+
+
 def run_screening_phase() -> dict[str, pd.DataFrame]:
     """Load cached candidate price data and run screening plus formation-period hedge ratio estimation.
 
     Standalone convenience entry point for just the screening and
-    hedge-ratio stages. `run_pipeline_through_metrics` runs this same
+    hedge-ratio stages. `run_pipeline_through_validation` runs this same
     work (without a second data load) plus signal generation,
-    backtesting, and metrics summarisation.
+    backtesting, metrics summarisation, and statistical validation.
 
     Returns:
         The dict returned by `screen_and_select_pairs`, with an added
@@ -367,16 +540,15 @@ def run_screening_phase() -> dict[str, pd.DataFrame]:
     return results
 
 
-def run_pipeline_through_metrics() -> dict[str, pd.DataFrame]:
-    """Load data once and run every implemented stage: screening, hedge ratios, signals, backtest, metrics.
+def run_pipeline_through_validation() -> dict[str, pd.DataFrame]:
+    """Load data once and run every stage: screening, hedge ratios, signals, backtest, metrics, validation.
 
     This is the current top-level entry point (called from `__main__`).
     Loads the price panel a single time (unlike calling
-    `run_screening_phase` followed by separate signals/backtest/metrics
-    steps, which would reload it) and threads it through
+    `run_screening_phase` followed by separate signals/backtest/metrics/
+    validation steps, which would reload it) and threads it through
     `screen_and_select_pairs` -> `build_hedge_ratios` -> `build_signals`
-    -> `run_backtest_phase` -> `run_metrics_phase`. `run_pipeline` will
-    eventually extend this with validation.py once implemented.
+    -> `run_backtest_phase` -> `run_metrics_phase` -> `run_validation_phase`.
 
     Returns:
         Dict merging: `screen_and_select_pairs`'s keys, "hedge_ratios"
@@ -384,8 +556,10 @@ def run_pipeline_through_metrics() -> dict[str, pd.DataFrame]:
         "signals_thresholds" (from `build_signals`),
         "backtest_all_periods"/"backtest_trading_period_1"/
         "backtest_trading_period_2"/"backtest_average_returns" (from
-        `run_backtest_phase`), and "metrics_by_pair"/"metrics_portfolio"
-        (from `run_metrics_phase`).
+        `run_backtest_phase`), "metrics_by_pair"/"metrics_portfolio"
+        (from `run_metrics_phase`), and "validation_bootstrap"/
+        "validation_permutation"/"validation_buy_and_hold" (from
+        `run_validation_phase`).
     """
     data_splits = load_and_split_data()
     full_prices = data_splits["full"]
@@ -410,24 +584,27 @@ def run_pipeline_through_metrics() -> dict[str, pd.DataFrame]:
     results["metrics_by_pair"] = metrics_results["by_pair"]
     results["metrics_portfolio"] = metrics_results["portfolio"]
 
+    validation_results = run_validation_phase(full_prices, backtest_results)
+    results["validation_bootstrap"] = validation_results["bootstrap"]
+    results["validation_permutation"] = validation_results["permutation"]
+    results["validation_buy_and_hold"] = validation_results["buy_and_hold"]
+
     return results
 
 
 def run_pipeline() -> dict[str, pd.DataFrame]:
     """Run the full pipeline end-to-end and produce final tables/figures.
 
-    Orchestrates `run_pipeline_through_metrics` (data loading, screening,
-    hedge ratios, signals, backtest, metrics) plus validation.py, once
+    Thin alias for `run_pipeline_through_validation`, kept as a stable
+    name now that every stage (screening through validation) is
     implemented.
 
     Returns:
-        Dict of result tables keyed by name (e.g. "screened_pairs",
-        "backtest_summary", "validation_summary"), suitable for writing to
-        config.RESULTS_DIR.
+        The dict returned by `run_pipeline_through_validation`.
     """
-    raise NotImplementedError
+    return run_pipeline_through_validation()
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run_pipeline_through_metrics()
+    run_pipeline_through_validation()

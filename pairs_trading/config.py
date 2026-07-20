@@ -158,8 +158,24 @@ RISK_FREE_RATE_ANNUAL: Final[float] = 0.02
 # ---------------------------------------------------------------------------
 # Validation (validation.py)
 # ---------------------------------------------------------------------------
-N_BOOTSTRAP_SAMPLES: Final[int] = 1000
+# Number of circular block-bootstrap resamples per return series in
+# bootstrap_significance_test. Updated from an initial placeholder of 1000
+# to 10000 for a smoother empirical distribution/CI, now that the resampling
+# is fully vectorised (see validation.py) and the extra draws are cheap.
+N_BOOTSTRAP_SAMPLES: Final[int] = 10_000
 BOOTSTRAP_RANDOM_SEED: Final[int] = 42
+
+# Block length (trading days) for the circular block bootstrap, chosen to
+# be long enough to preserve short-run autocorrelation in the daily return
+# series (roughly a trading month) without being so long that too few
+# independent blocks are available to resample from.
+BOOTSTRAP_BLOCK_SIZE: Final[int] = 20
+
+# Number of Monte Carlo simulations in random_pair_benchmark. Each
+# simulation re-runs the full hedge_ratio -> signals -> backtest pipeline
+# on N_PAIRS_TO_SELECT randomly drawn pairs, so this is deliberately much
+# smaller than N_BOOTSTRAP_SAMPLES (which only needs cheap vectorised numpy
+# resampling, not a full pipeline re-run per draw).
 N_RANDOM_PAIRS_BENCHMARK: Final[int] = 50
 
 # ---------------------------------------------------------------------------
