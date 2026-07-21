@@ -173,10 +173,13 @@ BOOTSTRAP_BLOCK_SIZE: Final[int] = 20
 
 # Number of Monte Carlo simulations in random_pair_benchmark. Each
 # simulation re-runs the full hedge_ratio -> signals -> backtest pipeline
-# on N_PAIRS_TO_SELECT randomly drawn pairs, so this is deliberately much
-# smaller than N_BOOTSTRAP_SAMPLES (which only needs cheap vectorised numpy
-# resampling, not a full pipeline re-run per draw).
-N_RANDOM_PAIRS_BENCHMARK: Final[int] = 50
+# on N_PAIRS_TO_SELECT randomly drawn pairs (unlike N_BOOTSTRAP_SAMPLES,
+# which only needs cheap vectorised numpy resampling). Measured at ~1.1s
+# per 50 simulations, so 10,000 simulations costs roughly 3-4 minutes --
+# affordable, and worth it for a much less noisy p-value/percentile
+# estimate, since this number is cited directly in the report as evidence
+# for or against the selection methodology adding value.
+N_RANDOM_PAIRS_BENCHMARK: Final[int] = 10_000
 
 # ---------------------------------------------------------------------------
 # Shared constants
